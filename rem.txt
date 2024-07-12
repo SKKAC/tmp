@@ -1,0 +1,179 @@
+#include <ros/ros.h>
+#include <geometry_msgs/Twist.h>
+#include <nav_msgs/Odometry.h>
+#include <tf/transform_broadcaster.h>
+#include <tf/transform_listener.h>
+#include <Eigen/Dense>
+
+class CmdVelOdomNode
+{
+public:
+    CmdVelOdomNode()
+    {
+        // 订阅cmd_vel话题
+        cmd_vel_sub_ = nh_.subscribe("cmd_vel", 1000, &CmdVelOdomNode::cmdVelCallback, this);
+
+        // 发布里程计话题
+        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("odom", 50);
+
+        // 初始化
+        current_time_ = ros::Time::now();
+        last_time_ = ros::Time::now();
+        last_cartographer_time_ = ros::Time(0);
+        odom_frame_id_ = "odom";
+        base_link_frame_id_ = "base_link2";
+        cartographer_frame_id_ = "base_footprint";
+
+        // 初始化位置和四元数
+        position_.setZero();
+        orientation_ = Eigen::Quaterniond::Identity();
+
+        // 初始值标志
+        has_cartographer_transform_ = false;
+
+        // 初始化线速度和角速度
+        linear_velocity_ = 0.0;
+        angular_velocity_ = 0.0;
+
+        // 速度比例系数
+        linear_scale_ = 1.0;  // 线速度系数
+        angular_scale_ = 1.0; // 角速度系数
+    }
+
+    void spin()
+    {
+        ros::Rate rate(50);
+        while (ros::ok())
+        {
+            ros::spinOnce();
+            updatePosition();
+            publishOdom();
+            rate.sleep();
+        }
+    }
+
+private:
+    ros::NodeHandle nh_;
+    ros::Subscriber cmd_vel_sub_;
+    ros::Publisher odom_pub_;
+    tf::TransformBroadcaster odom_broadcaster_;
+    tf::TransformListener tf_listener_;
+    Eigen::Vector3d position_;
+    Eigen::Quaterniond orientation_;
+    double linear_velocity_;
+    double angular_velocity_;
+    double linear_scale_;
+    double angular_scale_;
+    ros::Time current_time_, last_time_, last_cartographer_time_;
+    std::string odom_frame_id_, base_link_frame_id_, cartographer_frame_id_;
+    bool has_cartographer_transform_;
+
+    void cmdVelCallback(const geometry_msgs::Twist::ConstPtr& msg)
+    {
+        // 获取cmd_vel中的线速度和角速度
+        linear_velocity_ = msg->linear.x * linear_scale_;
+        angular_velocity_ = msg->angular.z * angular_scale_;
+    }
+
+    void updatePosition()
+    {
+        current_time_ = ros::Time::now();
+        double dt = (current_time_ - last_time_).toSec();
+        
+        if (dt > 0)
+        {
+            // 基于线速度和角速度更新位置和朝向
+            double delta_x = linear_velocity_ * dt;
+            double delta_theta = angular_velocity_ * dt;
+
+            // 计算新的位置
+            position_.x() += delta_x * cos(orientation_.toRotationMatrix().eulerAngles(0, 1, 2)[2]);
+            position_.y() += delta_x * sin(orientation_.toRotationMatrix().eulerAngles(0, 1, 2)[2]);
+
+            // 计算新的朝向
+            Eigen::Quaterniond delta_orientation(Eigen::AngleAxisd(delta_theta, Eigen::Vector3d::UnitZ()));
+            orientation_ *= delta_orientation;
+
+            last_time_ = current_time_;
+        }
+    }
+
+    void publishOdom()
+    {
+        // 发布里程计信息
+        nav_msgs::Odometry odom;
+        odom.header.stamp = current_time_;
+        odom.header.frame_id = odom_frame_id_;
+        odom.child_frame_id = base_link_frame_id_;
+
+        // 发布位置信息
+        odom.pose.pose.position.x = position_.x();
+        odom.pose.pose.position.y = position_.y();
+        odom.pose.pose.position.z = position_.z();
+        odom.pose.pose.orientation.x = orientation_.x();
+        odom.pose.pose.orientation.y = orientation_.y();
+        odom.pose.pose.orientation.z = orientation_.z();
+        odom.pose.pose.orientation.w = orientation_.w();
+
+        // 发布速度信息
+        odom.twist.twist.linear.x = linear_velocity_;
+        odom.twist.twist.angular.z = angular_velocity_;
+
+        odom_pub_.publish(odom);
+
+        // 发布TF变换
+        tf::Transform transform;
+        transform.setOrigin(tf::Vector3(position_.x(), position_.y(), position_.z()));
+        tf::Quaternion q(orientation_.x(), orientation_.y(), orientation_.z(), orientation_.w());
+        transform.setRotation(q);
+        odom_broadcaster_.sendTransform(tf::StampedTransform(transform, ros::Time::now(), odom_frame_id_, base_link_frame_id_));
+
+        // 监听cartographer发布的变换
+        tf::StampedTransform cartographer_transform;
+        try
+        {
+            tf_listener_.lookupTransform(odom_frame_id_, cartographer_frame_id_, ros::Time(0), cartographer_transform);
+            ros::Duration transform_age = current_time_ - cartographer_transform.stamp_;
+            if (transform_age.toSec() < 1.0)
+            {
+                // 更新里程计和TF信息
+                Eigen::Vector3d new_position(cartographer_transform.getOrigin().x(),
+                                             cartographer_transform.getOrigin().y(),
+                                             cartographer_transform.getOrigin().z());
+                Eigen::Quaterniond new_orientation(cartographer_transform.getRotation().w(),
+                                                   cartographer_transform.getRotation().x(),
+                                                   cartographer_transform.getRotation().y(),
+                                                   cartographer_transform.getRotation().z());
+
+                if ((current_time_ - last_cartographer_time_).toSec() < 0.5)
+                {
+                    Eigen::Vector3d position_diff = new_position - position_;
+                    double time_diff = (current_time_ - last_cartographer_time_).toSec();
+                    if (time_diff > 0) {
+                        linear_velocity_ = position_diff.norm() / time_diff;
+                    }
+                }
+
+                position_ = new_position;
+                orientation_ = new_orientation;
+                last_cartographer_time_ = current_time_;
+                has_cartographer_transform_ = true;
+            }
+        }
+        catch (tf::TransformException &ex)
+        {
+            // 如果是因为找不到变换导致的异常，且cartographer没有发布任何变换，则不打印警告
+            if (has_cartographer_transform_) {
+                ROS_WARN("%s", ex.what());
+            }
+        }
+    }
+};
+
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "cmd_vel_odom_node");
+    CmdVelOdomNode cmd_vel_odom_node;
+    cmd_vel_odom_node.spin();
+    return 0;
+}
