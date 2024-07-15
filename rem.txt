@@ -1,179 +1,302 @@
-#include <ros/ros.h>
-#include <geometry_msgs/Twist.h>
-#include <nav_msgs/Odometry.h>
-#include <tf/transform_broadcaster.h>
-#include <tf/transform_listener.h>
-#include <Eigen/Dense>
+#include <pluginlib/class_list_macros.h>
+#include "pid_planner.h"
 
-class CmdVelOdomNode
+PLUGINLIB_EXPORT_CLASS(pid_planner::PIDPlanner, nav_core::BaseLocalPlanner)
+
+namespace pid_planner
 {
-public:
-    CmdVelOdomNode()
-    {
-        // 订阅cmd_vel话题
-        cmd_vel_sub_ = nh_.subscribe("cmd_vel", 1000, &CmdVelOdomNode::cmdVelCallback, this);
-
-        // 发布里程计话题
-        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("odom", 50);
-
-        // 初始化
-        current_time_ = ros::Time::now();
-        last_time_ = ros::Time::now();
-        last_cartographer_time_ = ros::Time(0);
-        odom_frame_id_ = "odom";
-        base_link_frame_id_ = "base_link2";
-        cartographer_frame_id_ = "base_footprint";
-
-        // 初始化位置和四元数
-        position_.setZero();
-        orientation_ = Eigen::Quaterniond::Identity();
-
-        // 初始值标志
-        has_cartographer_transform_ = false;
-
-        // 初始化线速度和角速度
-        linear_velocity_ = 0.0;
-        angular_velocity_ = 0.0;
-
-        // 速度比例系数
-        linear_scale_ = 1.0;  // 线速度系数
-        angular_scale_ = 1.0; // 角速度系数
-    }
-
-    void spin()
-    {
-        ros::Rate rate(50);
-        while (ros::ok())
-        {
-            ros::spinOnce();
-            updatePosition();
-            publishOdom();
-            rate.sleep();
-        }
-    }
-
-private:
-    ros::NodeHandle nh_;
-    ros::Subscriber cmd_vel_sub_;
-    ros::Publisher odom_pub_;
-    tf::TransformBroadcaster odom_broadcaster_;
-    tf::TransformListener tf_listener_;
-    Eigen::Vector3d position_;
-    Eigen::Quaterniond orientation_;
-    double linear_velocity_;
-    double angular_velocity_;
-    double linear_scale_;
-    double angular_scale_;
-    ros::Time current_time_, last_time_, last_cartographer_time_;
-    std::string odom_frame_id_, base_link_frame_id_, cartographer_frame_id_;
-    bool has_cartographer_transform_;
-
-    void cmdVelCallback(const geometry_msgs::Twist::ConstPtr& msg)
-    {
-        // 获取cmd_vel中的线速度和角速度
-        linear_velocity_ = msg->linear.x * linear_scale_;
-        angular_velocity_ = msg->angular.z * angular_scale_;
-    }
-
-    void updatePosition()
-    {
-        current_time_ = ros::Time::now();
-        double dt = (current_time_ - last_time_).toSec();
-        
-        if (dt > 0)
-        {
-            // 基于线速度和角速度更新位置和朝向
-            double delta_x = linear_velocity_ * dt;
-            double delta_theta = angular_velocity_ * dt;
-
-            // 计算新的位置
-            position_.x() += delta_x * cos(orientation_.toRotationMatrix().eulerAngles(0, 1, 2)[2]);
-            position_.y() += delta_x * sin(orientation_.toRotationMatrix().eulerAngles(0, 1, 2)[2]);
-
-            // 计算新的朝向
-            Eigen::Quaterniond delta_orientation(Eigen::AngleAxisd(delta_theta, Eigen::Vector3d::UnitZ()));
-            orientation_ *= delta_orientation;
-
-            last_time_ = current_time_;
-        }
-    }
-
-    void publishOdom()
-    {
-        // 发布里程计信息
-        nav_msgs::Odometry odom;
-        odom.header.stamp = current_time_;
-        odom.header.frame_id = odom_frame_id_;
-        odom.child_frame_id = base_link_frame_id_;
-
-        // 发布位置信息
-        odom.pose.pose.position.x = position_.x();
-        odom.pose.pose.position.y = position_.y();
-        odom.pose.pose.position.z = position_.z();
-        odom.pose.pose.orientation.x = orientation_.x();
-        odom.pose.pose.orientation.y = orientation_.y();
-        odom.pose.pose.orientation.z = orientation_.z();
-        odom.pose.pose.orientation.w = orientation_.w();
-
-        // 发布速度信息
-        odom.twist.twist.linear.x = linear_velocity_;
-        odom.twist.twist.angular.z = angular_velocity_;
-
-        odom_pub_.publish(odom);
-
-        // 发布TF变换
-        tf::Transform transform;
-        transform.setOrigin(tf::Vector3(position_.x(), position_.y(), position_.z()));
-        tf::Quaternion q(orientation_.x(), orientation_.y(), orientation_.z(), orientation_.w());
-        transform.setRotation(q);
-        odom_broadcaster_.sendTransform(tf::StampedTransform(transform, ros::Time::now(), odom_frame_id_, base_link_frame_id_));
-
-        // 监听cartographer发布的变换
-        tf::StampedTransform cartographer_transform;
-        try
-        {
-            tf_listener_.lookupTransform(odom_frame_id_, cartographer_frame_id_, ros::Time(0), cartographer_transform);
-            ros::Duration transform_age = current_time_ - cartographer_transform.stamp_;
-            if (transform_age.toSec() < 1.0)
-            {
-                // 更新里程计和TF信息
-                Eigen::Vector3d new_position(cartographer_transform.getOrigin().x(),
-                                             cartographer_transform.getOrigin().y(),
-                                             cartographer_transform.getOrigin().z());
-                Eigen::Quaterniond new_orientation(cartographer_transform.getRotation().w(),
-                                                   cartographer_transform.getRotation().x(),
-                                                   cartographer_transform.getRotation().y(),
-                                                   cartographer_transform.getRotation().z());
-
-                if ((current_time_ - last_cartographer_time_).toSec() < 0.5)
-                {
-                    Eigen::Vector3d position_diff = new_position - position_;
-                    double time_diff = (current_time_ - last_cartographer_time_).toSec();
-                    if (time_diff > 0) {
-                        linear_velocity_ = position_diff.norm() / time_diff;
-                    }
-                }
-
-                position_ = new_position;
-                orientation_ = new_orientation;
-                last_cartographer_time_ = current_time_;
-                has_cartographer_transform_ = true;
-            }
-        }
-        catch (tf::TransformException &ex)
-        {
-            // 如果是因为找不到变换导致的异常，且cartographer没有发布任何变换，则不打印警告
-            if (has_cartographer_transform_) {
-                ROS_WARN("%s", ex.what());
-            }
-        }
-    }
-};
-
-int main(int argc, char** argv)
+/**
+ * @brief Construct a new PIDPlanner object
+ */
+PIDPlanner::PIDPlanner() : initialized_(false), goal_reached_(false), tf_(nullptr), delay_(0.1)  // Example delay of 100ms
 {
-    ros::init(argc, argv, "cmd_vel_odom_node");
-    CmdVelOdomNode cmd_vel_odom_node;
-    cmd_vel_odom_node.spin();
-    return 0;
 }
+
+/**
+ * @brief Construct a new PIDPlanner object
+ */
+PIDPlanner::PIDPlanner(std::string name, tf2_ros::Buffer* tf, costmap_2d::Costmap2DROS* costmap_ros) : PIDPlanner()
+{
+  initialize(name, tf, costmap_ros);
+}
+
+/**
+ * @brief Destroy the PIDPlanner object
+ */
+PIDPlanner::~PIDPlanner()
+{
+}
+
+/**
+ * @brief Initialization of the local planner
+ * @param name        the name to give this instance of the trajectory planner
+ * @param tf          a pointer to a transform listener
+ * @param costmap_ros the cost map to use for assigning costs to trajectories
+ */
+void PIDPlanner::initialize(std::string name, tf2_ros::Buffer* tf, costmap_2d::Costmap2DROS* costmap_ros)
+{
+  if (!initialized_)
+  {
+    initialized_ = true;
+    tf_ = tf;
+    costmap_ros_ = costmap_ros;
+
+    ros::NodeHandle nh = ros::NodeHandle("~/" + name);
+
+    // base
+    nh.param("goal_dist_tolerance", goal_dist_tol_, 0.2);
+    nh.param("rotate_tolerance", rotate_tol_, 0.5);
+    nh.param("base_frame", base_frame_, base_frame_);
+    nh.param("map_frame", map_frame_, map_frame_);
+
+    // lookahead
+    nh.param("lookahead_time", lookahead_time_, 0.5);
+    nh.param("min_lookahead_dist", min_lookahead_dist_, 0.3);
+    nh.param("max_lookahead_dist", max_lookahead_dist_, 0.9);
+
+    // linear velocity
+    nh.param("max_v", max_v_, 0.5);
+    nh.param("min_v", min_v_, 0.0);
+    nh.param("max_v_inc", max_v_inc_, 0.5);
+
+    // angular velocity
+    nh.param("max_w", max_w_, 1.57);
+    nh.param("min_w", min_w_, 0.0);
+    nh.param("max_w_inc", max_w_inc_, 1.57);
+
+    // PID parameters
+    nh.param("k_v_p", k_v_p_, 1.00);
+    nh.param("k_v_i", k_v_i_, 0.01);
+    nh.param("k_v_d", k_v_d_, 0.10);
+    nh.param("k_w_p", k_w_p_, 1.00);
+    nh.param("k_w_i", k_w_i_, 0.01);
+    nh.param("k_w_d", k_w_d_, 0.10);
+    nh.param("k_theta", k_theta_, 0.5);
+    nh.param("k", k_, 1.0);
+    nh.param("l", l_, 0.2);
+
+    e_v_ = i_v_ = 0.0;
+    e_w_ = i_w_ = 0.0;
+
+    double controller_frequency;
+    nh.param("/move_base/controller_frequency", controller_frequency, 10.0);
+    d_t_ = 1 / controller_frequency;
+
+    target_pose_pub_ = nh.advertise<geometry_msgs::PoseStamped>("/target_pose", 10);
+    current_pose_pub_ = nh.advertise<geometry_msgs::PoseStamped>("/current_pose", 10);
+
+    ROS_INFO("PID planner initialized!");
+  }
+  else
+  {
+    ROS_WARN("PID planner has already been initialized.");
+  }
+}
+
+/**
+ * @brief Set the plan that the controller is following
+ * @param orig_global_plan the plan to pass to the controller
+ * @return true if the plan was updated successfully, else false
+ */
+bool PIDPlanner::setPlan(const std::vector<geometry_msgs::PoseStamped>& orig_global_plan)
+{
+  if (!initialized_)
+  {
+    ROS_ERROR("This planner has not been initialized, please call initialize() before using this planner");
+    return false;
+  }
+
+  ROS_INFO("Got new plan");
+
+  // set new plan
+  global_plan_.clear();
+  global_plan_ = orig_global_plan;
+
+  // receive a plan for a new goal
+  if (goal_x_ != global_plan_.back().pose.position.x || goal_y_ != global_plan_.back().pose.position.y)
+  {
+    goal_x_ = global_plan_.back().pose.position.x;
+    goal_y_ = global_plan_.back().pose.position.y;
+    goal_rpy_ = getEulerAngles(global_plan_.back());
+    goal_reached_ = false;
+
+    e_v_ = i_v_ = 0.0;
+    e_w_ = i_w_ = 0.0;
+  }
+
+  return true;
+}
+
+/**
+ * @brief Check if the goal pose has been achieved
+ * @return true if achieved, false otherwise
+ */
+bool PIDPlanner::isGoalReached()
+{
+  if (!initialized_)
+  {
+    ROS_ERROR("PID planner has not been initialized");
+    return false;
+  }
+
+  if (goal_reached_)
+  {
+    ROS_INFO("GOAL Reached!");
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @brief Given the current position, orientation, and velocity of the robot, compute the velocity commands
+ * @param cmd_vel will be filled with the velocity command to be passed to the robot base
+ * @return true if a valid trajectory was found, else false
+ */
+bool PIDPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
+{
+  if (!initialized_)
+  {
+    ROS_ERROR("PID planner has not been initialized");
+    return false;
+  }
+
+  // odometry observation - getting robot velocities in odom
+  nav_msgs::Odometry base_odom;
+  odom_helper_->getOdom(base_odom);
+
+  // get robot position in map
+  geometry_msgs::PoseStamped current_ps_odom, current_ps_map, target_ps_map;
+  costmap_ros_->getRobotPose(current_ps_odom);
+  transformPose(tf_, map_frame_, current_ps_odom, current_ps_map);
+
+  // prune the global plan
+  std::vector<geometry_msgs::PoseStamped> prune_plan = prune(current_ps_map);
+
+  // calculate look-ahead distance
+  double vt = std::hypot(base_odom.twist.twist.linear.x, base_odom.twist.twist.linear.y);
+  double wt = base_odom.twist.twist.angular.z;
+  double L = getLookAheadDistance(vt);
+
+  // get the particular point on the path at the lookahead distance
+  geometry_msgs::PointStamped lookahead_pt;
+  double theta_d, theta_dir, theta_trj, kappa;
+  getLookAheadPoint(L, current_ps_map, prune_plan, lookahead_pt, theta_trj, kappa);
+  target_ps_map.pose.position.x = lookahead_pt.point.x;
+  target_ps_map.pose.position.y = lookahead_pt.point.y;
+  theta_dir = atan2((target_ps_map.pose.position.y - current_ps_map.pose.position.y),
+                    (target_ps_map.pose.position.x - current_ps_map.pose.position.x));
+  theta_d = regularizeAngle((1 - k_theta_) * theta_trj + k_theta_ * theta_dir);
+  tf2::Quaternion q;
+  q.setRPY(0, 0, theta_d);
+  tf2::convert(q, target_ps_map.pose.orientation);
+
+  // current angle
+  double theta = tf2::getYaw(current_ps_map.pose.orientation);  // [-pi, pi]
+
+  // position reached
+  if (shouldRotateToGoal(current_ps_map, global_plan_.back()))
+  {
+    double e_theta = regularizeAngle(goal_rpy_.z() - theta);
+
+    // orientation reached
+    if (!shouldRotateToPath(std::fabs(e_theta)))
+    {
+      cmd_vel.linear.x = 0.0;
+      cmd_vel.angular.z = 0.0;
+      goal_reached_ = true;
+    }
+    // orientation not reached
+    else
+    {
+      cmd_vel.linear.x = 0.0;
+      cmd_vel.angular.z = angularRegularization(base_odom, e_theta / d_t_);
+    }
+  }
+  // posistion not reached
+  else
+  {
+    Eigen::Vector3d s(current_ps_map.pose.position.x, current_ps_map.pose.position.y, theta);    // current state
+    Eigen::Vector3d s_d(target_ps_map.pose.position.x, target_ps_map.pose.position.y, theta_d);  // desired state
+    Eigen::Vector2d u_r(vt, wt);                                                                 // refered input
+    Eigen::Vector2d u = _pidControl(s, s_d, u_r);
+
+    cmd_vel.linear.x = linearRegularization(base_odom, u[0]);
+    cmd_vel.angular.z = angularRegularization(base_odom, u[1]);
+  }
+
+  // publish next target_ps_map pose
+  target_ps_map.header.frame_id = "map";
+  target_ps_map.header.stamp = ros::Time::now();
+  target_pose_pub_.publish(target_ps_map);
+
+  // publish robot pose
+  current_ps_map.header.frame_id = "map";
+  current_ps_map.header.stamp = ros::Time::now();
+  current_pose_pub_.publish(current_ps_map);
+
+  return true;
+}
+
+/**
+ * @brief Execute PID control process with Smith Predictor
+ * @param s   current state
+ * @param s_d desired state
+ * @param u_r refered input
+ * @return u  control vector
+ */
+Eigen::Vector2d PIDPlanner::_pidControl(Eigen::Vector3d s, Eigen::Vector3d s_d, Eigen::Vector2d u_r)
+{
+  Eigen::Vector2d u;
+  Eigen::Vector3d e = s_d - s;
+  Eigen::Vector2d sx_dot(k_ * e[0], k_ * e[1]);
+
+  // Smith Predictor Logic
+  // Predict future state considering the delay
+  Eigen::Vector3d s_future = s + d_t_ * Eigen::Vector3d(u_r[0] * cos(s[2]), u_r[0] * sin(s[2]), u_r[1]);
+  Eigen::Vector3d e_future = s_d - s_future;
+
+  // PID control for future state
+  double e_v_future = std::hypot(e_future[0], e_future[1]) / d_t_;
+  double e_w_future = e_future[2] / d_t_;
+
+  if (std::fabs(e_v_future) > max_v_)
+    e_v_future = std::copysign(max_v_, e_v_future);
+  if (std::fabs(e_w_future) > max_w_)
+    e_w_future = std::copysign(max_w_, e_w_future);
+
+  double i_v_future = e_v_future * d_t_;
+  double i_w_future = e_w_future * d_t_;
+
+  double d_v_future = (e_v_future - e_v_) / d_t_;
+  double d_w_future = (e_w_future - e_w_) / d_t_;
+
+  double v_inc_future = k_v_p_ * e_v_future + k_v_i_ * i_v_future + k_v_d_ * d_v_future;
+  double w_inc_future = k_w_p_ * e_w_future + k_w_i_ * i_w_future + k_w_d_ * d_w_future;
+
+  if (std::fabs(v_inc_future) > max_v_inc_)
+    v_inc_future = std::copysign(max_v_inc_, v_inc_future);
+  if (std::fabs(w_inc_future) > max_w_inc_)
+    w_inc_future = std::copysign(max_w_inc_, w_inc_future);
+
+  double v_cmd_future = u_r[0] + v_inc_future;
+  if (std::fabs(v_cmd_future) > max_v_)
+    v_cmd_future = std::copysign(max_v_, v_cmd_future);
+  else if (std::fabs(v_cmd_future) < min_v_)
+    v_cmd_future = std::copysign(min_v_, v_cmd_future);
+
+  double w_cmd_future = u_r[1] + w_inc_future;
+  if (std::fabs(w_cmd_future) > max_w_)
+    w_cmd_future = std::copysign(max_w_, w_cmd_future);
+  else if (std::fabs(w_cmd_future) < min_w_)
+    w_cmd_future = std::copysign(min_w_, w_cmd_future);
+
+  u[0] = v_cmd_future;
+  u[1] = w_cmd_future;
+
+  e_v_ = e_v_future;
+  e_w_ = e_w_future;
+
+  return u;
+}
+
+}  // namespace pid_planner
