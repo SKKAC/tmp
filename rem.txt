@@ -237,6 +237,16 @@ bool PIDPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
   return true;
 }
 
+void PIDPlanner::updateDelay(const Eigen::Vector3d& s, const Eigen::Vector3d& s_d, const Eigen::Vector2d& u_r, const Eigen::Vector3d& feedback)
+  {
+    // Calculate the observed delay based on the difference between the expected and actual state
+    double observed_delay = ((feedback - s).norm()) / (u_r.norm());
+
+    // Update delay with a moving average filter to smooth the value
+    static const double alpha = 0.1; // Smoothing factor, can be adjusted
+    delay_ = (1 - alpha) * delay_ + alpha * observed_delay;
+  }
+
 /**
  * @brief Execute PID control process with Smith Predictor
  * @param s   current state
@@ -246,6 +256,8 @@ bool PIDPlanner::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
  */
 Eigen::Vector2d PIDPlanner::_pidControl(Eigen::Vector3d s, Eigen::Vector3d s_d, Eigen::Vector2d u_r)
 {
+
+  updateDelay(s, s_d, u_r, feedback);
   Eigen::Vector2d u;
   Eigen::Vector3d e = s_d - s;
   Eigen::Vector2d sx_dot(k_ * e[0], k_ * e[1]);
