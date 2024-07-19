@@ -1,206 +1,80 @@
 #include <ros/ros.h>
 #include <sensor_msgs/LaserScan.h>
-#include <visualization_msgs/MarkerArray.h>
-#include <geometry_msgs/Point.h>
-#include <visualization_msgs/Marker.h>
-#include <geometry_msgs/Twist.h>
-#include <cmath>
-#include <vector>
-#include <random>
-#include <algorithm>
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl/point_types.h>
+#include <pcl/conversions.h>
+#include <pcl_ros/point_cloud.h>
+#include <pcl_ros/transforms.h>
 
-class LaserScanProcessor {
+class LaserScanFilter
+{
 public:
-    LaserScanProcessor() {
-        scan_sub_ = nh_.subscribe("scan", 10, &LaserScanProcessor::scanCallback, this);
-        filtered_scan_pub_ = nh_.advertise<sensor_msgs::LaserScan>("filtered_scan", 10);
-        marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("cluster_markers", 10);
-        cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("cmd_vel", 10);
+    LaserScanFilter()
+    {
+        // Initialize ROS node
+        ros::NodeHandle nh;
+
+        // Subscribe to the LaserScan topic
+        sub_ = nh.subscribe("/scan", 1, &LaserScanFilter::scanCallback, this);
+
+        // Advertise the filtered PointCloud topic
+        pub_ = nh.advertise<sensor_msgs::PointCloud2>("/filtered_points", 1);
     }
 
 private:
-    ros::NodeHandle nh_;
-    ros::Subscriber scan_sub_;
-    ros::Publisher filtered_scan_pub_;
-    ros::Publisher marker_pub_;
-    ros::Publisher cmd_vel_pub_;
+    ros::Subscriber sub_;
+    ros::Publisher pub_;
 
-    void scanCallback(const sensor_msgs::LaserScan::ConstPtr& scan_msg) {
-        sensor_msgs::LaserScan filtered_scan = *scan_msg;
-        filtered_scan.ranges.clear();
+    void scanCallback(const sensor_msgs::LaserScan::ConstPtr& scan)
+    {
+        // Create a PointCloud object to store the filtered points
+        pcl::PointCloud<pcl::PointXYZ> cloud;
 
-        std::vector<geometry_msgs::Point> points;
+        // Angle and distance thresholds
+        const float min_angle = M_PI / 3;   // 60 degrees to the right
+        const float max_angle = 2 * M_PI / 3; // 60 degrees to the left
+        const float max_distance = 3.0;     // 3 meters
 
-        for (size_t i = 0; i < scan_msg->ranges.size(); ++i) {
-            float angle = scan_msg->angle_min + i * scan_msg->angle_increment;
-            float distance = scan_msg->ranges[i];
+        // Iterate through the LaserScan ranges
+        for (size_t i = 0; i < scan->ranges.size(); ++i)
+        {
+            float angle = scan->angle_min + i * scan->angle_increment;
+            float range = scan->ranges[i];
 
-            if (angle > -M_PI/3 && angle < M_PI/3 && distance < 3.0) {
-                filtered_scan.ranges.push_back(distance);
+            // Check if the point is within the desired angle and distance range
+            if (angle > min_angle && angle < max_angle && range < max_distance)
+            {
+                // Convert polar coordinates to Cartesian coordinates
+                pcl::PointXYZ point;
+                point.x = range * cos(angle);
+                point.y = range * sin(angle);
+                point.z = 0.0;
 
-                geometry_msgs::Point point;
-                point.x = distance * cos(angle);
-                point.y = distance * sin(angle);
-                points.push_back(point);
+                // Add the point to the cloud
+                cloud.points.push_back(point);
             }
         }
 
-        filtered_scan_pub_.publish(filtered_scan);
+        // Convert the PointCloud to a ROS message
+        sensor_msgs::PointCloud2 output;
+        pcl::toROSMsg(cloud, output);
+        output.header = scan->header;
 
-        if (points.size() > 1) {
-            std::vector<std::vector<geometry_msgs::Point>> clusters = kMeansClustering(points, 3);
-            publishClusters(clusters);
-            processControl(clusters);
-        }
-    }
-
-    std::vector<std::vector<geometry_msgs::Point>> kMeansClustering(std::vector<geometry_msgs::Point>& points, int k) {
-        std::vector<geometry_msgs::Point> centroids;
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, points.size() - 1);
-
-        for (int i = 0; i < k; ++i) {
-            centroids.push_back(points[dis(gen)]);
-        }
-
-        std::vector<int> labels(points.size(), -1);
-        bool converged = false;
-
-        while (!converged) {
-            converged = true;
-
-            for (size_t i = 0; i < points.size(); ++i) {
-                int best_centroid = 0;
-                double best_distance = std::numeric_limits<double>::max();
-
-                for (int j = 0; j < k; ++j) {
-                    double distance = std::hypot(points[i].x - centroids[j].x, points[i].y - centroids[j].y);
-                    if (distance < best_distance) {
-                        best_distance = distance;
-                        best_centroid = j;
-                    }
-                }
-
-                if (labels[i] != best_centroid) {
-                    labels[i] = best_centroid;
-                    converged = false;
-                }
-            }
-
-            std::vector<geometry_msgs::Point> new_centroids(k, geometry_msgs::Point());
-            std::vector<int> count(k, 0);
-
-            for (size_t i = 0; i < points.size(); ++i) {
-                new_centroids[labels[i]].x += points[i].x;
-                new_centroids[labels[i]].y += points[i].y;
-                ++count[labels[i]];
-            }
-
-            for (int j = 0; j < k; ++j) {
-                if (count[j] > 0) {
-                    new_centroids[j].x /= count[j];
-                    new_centroids[j].y /= count[j];
-                } else {
-                    new_centroids[j] = points[dis(gen)];
-                }
-            }
-
-            centroids = new_centroids;
-        }
-
-        std::vector<std::vector<geometry_msgs::Point>> clusters(k);
-        for (size_t i = 0; i < points.size(); ++i) {
-            clusters[labels[i]].push_back(points[i]);
-        }
-
-        return clusters;
-    }
-
-    void publishClusters(const std::vector<std::vector<geometry_msgs::Point>>& clusters) {
-        visualization_msgs::MarkerArray marker_array;
-        for (size_t i = 0; i < clusters.size(); ++i) {
-            const auto& cluster = clusters[i];
-
-            visualization_msgs::Marker marker;
-            marker.header.frame_id = "base_link";
-            marker.header.stamp = ros::Time::now();
-            marker.ns = "clusters";
-            marker.id = i;
-            marker.type = visualization_msgs::Marker::SPHERE;
-            marker.action = visualization_msgs::Marker::ADD;
-
-            geometry_msgs::Point centroid;
-            for (const auto& point : cluster) {
-                centroid.x += point.x;
-                centroid.y += point.y;
-            }
-            centroid.x /= cluster.size();
-            centroid.y /= cluster.size();
-
-            marker.pose.position = centroid;
-            marker.scale.x = marker.scale.y = marker.scale.z = 0.2;
-            marker.color.r = 1.0;
-            marker.color.g = 0.0;
-            marker.color.b = 0.0;
-            marker.color.a = 1.0;
-
-            marker_array.markers.push_back(marker);
-
-            double direction = std::atan2(centroid.y, centroid.x);
-            double distance = std::hypot(centroid.x, centroid.y);
-
-            ROS_INFO("Cluster %lu: Direction = %f, Distance = %f", i, direction, distance);
-        }
-
-        marker_pub_.publish(marker_array);
-    }
-
-    void processControl(const std::vector<std::vector<geometry_msgs::Point>>& clusters) {
-        if (clusters.empty()) {
-            return;
-        }
-
-        // Find the closest cluster
-        double min_distance = std::numeric_limits<double>::max();
-        geometry_msgs::Point closest_centroid;
-
-        for (const auto& cluster : clusters) {
-            geometry_msgs::Point centroid;
-            for (const auto& point : cluster) {
-                centroid.x += point.x;
-                centroid.y += point.y;
-            }
-            centroid.x /= cluster.size();
-            centroid.y /= cluster.size();
-
-            double distance = std::hypot(centroid.x, centroid.y);
-            if (distance < min_distance) {
-                min_distance = distance;
-                closest_centroid = centroid;
-            }
-        }
-
-        // Calculate control command to move away from the closest cluster
-        geometry_msgs::Twist cmd_vel;
-        double angle_to_centroid = std::atan2(closest_centroid.y, closest_centroid.x);
-
-        // Simple proportional controller
-        if (min_distance < 1.0) {  // Adjust threshold as needed
-            cmd_vel.linear.x = -0.5;  // Move backward
-            cmd_vel.angular.z = -angle_to_centroid;  // Turn away from the obstacle
-        } else {
-            cmd_vel.linear.x = 0.0;
-            cmd_vel.angular.z = 0.0;
-        }
-
-        cmd_vel_pub_.publish(cmd_vel);
+        // Publish the filtered points
+        pub_.publish(output);
     }
 };
 
-int main(int argc, char** argv) {
-    ros::init(argc, argv, "laser_scan_processor");
-    LaserScanProcessor processor;
+int main(int argc, char** argv)
+{
+    // Initialize ROS
+    ros::init(argc, argv, "laserscan_filter");
+
+    // Create the LaserScanFilter object
+    LaserScanFilter filter;
+
+    // Spin to process callbacks
     ros::spin();
+
     return 0;
 }
