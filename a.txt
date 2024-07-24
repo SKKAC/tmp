@@ -5,7 +5,7 @@
 #include <pcl/conversions.h>
 #include <pcl_ros/point_cloud.h>
 #include <pcl_ros/transforms.h>
-
+5ab00a6f739e0f6536d02488f101aa6f
 class LaserScanFilter
 {
 public:
